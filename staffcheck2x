@@ -1,0 +1,982 @@
+--[[
+    STAFF CHECK + TAP x25  (v2 - accurate detection)
+    =============================================================
+    • Tap multiplier x25 (~50 CPS, burst then replay)
+    • Higher-up detection:
+        1) Game creator (user-owned)               -> OWNER
+        2) Game's own creator group rank >= 255    -> OWNER
+        3) Game's own creator group rank >= 200    -> ADMIN
+        4) Game's own creator group rank >= 100    -> MOD
+        5) Extra groups (configurable thresholds)  -> OWNER/ADMIN/MOD
+        6) KnownStaff map (manual override)        -> any level
+        7) Strict admin-tool names (HD Admin, Adonis, Kohl's, Cmdr, BAE)
+        8) Roblox staff check (OFF by default — unreliable)
+    • NO team-name scanning, NO keyword tool matching, NO GetRankInGroup(1)
+      spam — these were the main sources of false "higher-up" claims.
+    • Red cham (Highlight) + floating rank icon above head
+    • Separate "Higher Up Chams" toggle so detection (notifications) and
+      visuals can be controlled independently.
+    • Warns "No higher-ups detected in this server" when none found.
+]]
+
+local Players      = game:GetService("Players")
+local UIS          = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VIM          = game:GetService("VirtualInputManager")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+--==================== TAP CONFIG ============================
+local MULTIPLIER   = 25
+local BURST_COUNT  = 6
+local BURST_GAP    = 0.003
+local REPLAY_GAP   = 0.02
+local PRESS_GAP    = 0.001
+local DEBOUNCE     = 0.03
+--=============================================================
+
+--==================== STAFF CHECK CONFIG ====================
+local STAFF_CONFIG = {
+    -- ---- Group-rank thresholds (applied to the GAME'S OWN creator group) ----
+    -- Only the game's official group is checked automatically. Lower Mod to
+    -- catch more players; raise it to catch fewer. Set Mod = 255 to disable.
+    OwnerRankThreshold = 255,
+    AdminRankThreshold = 200,
+    ModRankThreshold   = 100,
+
+    -- ---- Extra groups to scan (optional) ----
+    -- Format:  [groupId] = { owner = 255, admin = 200, mod = 100 }
+    ExtraGroups = {},
+
+    -- ---- Manually trusted staff (manual override) ----
+    -- Format:  ["username_lowercase"] = "owner" | "admin" | "mod" | "staff"
+    KnownStaff = {},
+
+    -- ---- Strict admin-tool base names (exact / prefix match only) ----
+    -- A tool only counts if its lowercased name equals one of these, or
+    -- begins with the base followed by a space, "(", or "[".
+    -- This avoids matching random tools like "Commander Sword" or "Admin Abuse".
+    AdminToolNames = {
+        "hd admin", "adonis", "adonis admin",
+        "kohl's admin", "kohls admin",
+        "cmdr", "cmdr admin",
+        "basic admin", "basic admin essentials",
+    },
+
+    FlagCreator      = true,   -- flag game creator as OWNER
+    CheckRobloxStaff = false,  -- unreliable; leave OFF
+
+    ScanInterval     = 4,      -- seconds between scans
+    DeepScanInterval = 30,     -- seconds between admin-system deep scans
+    InitialGraceTime = 3,      -- wait after join before first full scan
+
+    -- ---- Red highlight (was purple) ----
+    HighlightColor               = Color3.fromRGB(255, 26, 26),
+    HighlightOutlineColor        = Color3.fromRGB(255, 90, 90),
+    HighlightFillTransparency    = 0.5,
+    HighlightOutlineTransparency = 0.0,
+
+    -- ---- Floating icon above head ----
+    IconStudsOffset = 2.4,
+    IconMaxDistance = 300,
+    IconShowLabel   = true,
+
+    -- ---- Admin-system detection (informational only) ----
+    KnownSystems = {
+        ["HD Admin"]               = {"HDAdmin", "HD Admin", "HDAdminClient", "HDAdmin_Client", "HDAdmin_Server"},
+        ["Adonis"]                 = {"Adonis", "AdonisClient", "AdonisClientLoader", "Adonis_Server"},
+        ["Kohl's Admin"]           = {"KohlsAdmin", "KohlsAdminClient", "KohlAdmin", "KohlAdminClient"},
+        ["Cmdr"]                   = {"Cmdr", "CmdrClient"},
+        ["Basic Admin Essentials"] = {"Basic Admin Essentials", "BasicAdmin", "BAE"},
+    },
+    AdminKeywords = {
+        "hdadmin", "hd admin", "hd_admin", "adonis", "kohls", "kohl", "cmdr",
+        "adminpanel", "admin panel", "admin_panel",
+        "commandbar", "command bar", "command_bar",
+        "staffpanel", "staff panel", "staff_panel",
+        "modpanel", "mod panel", "mod_panel",
+        "ownerpanel", "owner panel", "owner_panel",
+        "administrator",
+    },
+}
+
+local STAFF_STYLES = {
+    owner = { icon = "👑", color = Color3.fromRGB(255, 200, 50) },
+    admin = { icon = "🛡️", color = Color3.fromRGB(255, 90, 90) },
+    mod   = { icon = "🔧", color = Color3.fromRGB(90, 150, 255) },
+    staff = { icon = "⭐", color = Color3.fromRGB(180, 120, 255) },
+}
+local EMPTY_STYLE  = { icon = "🔍", color = Color3.fromRGB(200, 200, 200) }
+local SYSTEM_STYLE = { icon = "🖥️", color = Color3.fromRGB(120, 220, 255) }
+--=============================================================
+
+local enabled           = false
+local staffAlertEnabled = false
+local chamsEnabled      = false
+local staffScanRunning  = false
+local deepScanRunning   = false
+
+local knownStaff       = {}   -- [userId] = level
+local knownStaffReason = {}   -- [userId] = reason
+local staffHighlights  = {}
+local staffBillboards  = {}
+local staffTracked     = {}
+local detectedSystems  = {}
+local hasWarnedNoStaff = false
+local lastDeepScan     = 0
+
+local rankCache    = {}       -- [userId:groupId] = { rank = n, t = clock }
+local RANK_CACHE_TTL = 180    -- seconds
+
+local simulatedUntil = 0
+
+--==================== GUI: SCREENGUI ========================
+local gui = Instance.new("ScreenGui")
+gui.Name           = "StaffCheck"
+gui.ResetOnSpawn   = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder   = 9999
+gui.Parent         = playerGui
+
+--==================== NOTIFICATIONS =========================
+local NOTIF_WIDTH  = 232
+local NOTIF_MARGIN = 14
+local NOTIF_TOP    = 90
+
+local notifHolder = Instance.new("Frame")
+notifHolder.Name                   = "Notifications"
+notifHolder.AnchorPoint            = Vector2.new(1, 0)
+notifHolder.Position               = UDim2.new(1, -NOTIF_MARGIN, 0, NOTIF_TOP)
+notifHolder.Size                   = UDim2.new(0, NOTIF_WIDTH, 0, 460)
+notifHolder.BackgroundTransparency = 1
+notifHolder.Parent                 = gui
+
+local notifLayout = Instance.new("UIListLayout")
+notifLayout.Padding = UDim.new(0, 8)
+notifLayout.Parent  = notifHolder
+
+local notifOrder = 0
+
+local function notify(text, isOn, style)
+    notifOrder += 1
+    local slot = Instance.new("Frame")
+    slot.Size                   = UDim2.new(1, 0, 0, 42)
+    slot.BackgroundTransparency = 1
+    slot.LayoutOrder            = notifOrder
+    slot.Parent                 = notifHolder
+
+    local card = Instance.new("CanvasGroup")
+    card.Size                   = UDim2.new(1, 0, 1, 0)
+    card.Position               = UDim2.new(0, 260, 0, 0)
+    card.BackgroundColor3       = Color3.fromRGB(24, 24, 31)
+    card.BackgroundTransparency = 0.05
+    card.GroupTransparency      = 1
+    card.Parent                 = slot
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 12)
+    c.Parent = card
+
+    local s = Instance.new("UIStroke")
+    s.Thickness = 1
+    if style then
+        s.Color        = style.color
+        s.Transparency = 0.15
+    else
+        s.Color        = Color3.fromRGB(70, 70, 88)
+        s.Transparency = 0.45
+    end
+    s.Parent = card
+
+    local dot = Instance.new("Frame")
+    dot.Size            = UDim2.new(0, 8, 0, 8)
+    dot.Position        = UDim2.new(0, 14, 0.5, -4)
+    dot.BorderSizePixel = 0
+    dot.BackgroundColor3 = style and style.color
+        or (isOn and Color3.fromRGB(0, 220, 130) or Color3.fromRGB(255, 90, 90))
+    dot.Parent = card
+
+    local dc = Instance.new("UICorner")
+    dc.CornerRadius = UDim.new(1, 0)
+    dc.Parent = dot
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Position              = UDim2.new(0, 32, 0, 0)
+    label.Size                  = UDim2.new(1, -44, 1, 0)
+    label.Font                  = Enum.Font.GothamMedium
+    label.TextSize              = 13
+    label.TextColor3            = style and style.color or Color3.fromRGB(240, 240, 246)
+    label.TextXAlignment        = Enum.TextXAlignment.Left
+    label.Text                  = style and (style.icon .. "  " .. text) or text
+    label.Parent                = card
+
+    TweenService:Create(card, TweenInfo.new(0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+        Position          = UDim2.new(0, 0, 0, 0),
+        GroupTransparency = 0,
+    }):Play()
+
+    task.delay(style and 3.8 or 2.2, function()
+        local out = TweenService:Create(card, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Position          = UDim2.new(0, 260, 0, 0),
+            GroupTransparency = 1,
+        })
+        out:Play()
+        out.Completed:Wait()
+        slot:Destroy()
+    end)
+end
+
+--==================== BUBBLE (❓) ===========================
+local bubble = Instance.new("TextButton")
+bubble.Name             = "Bubble"
+bubble.Size             = UDim2.new(0, 46, 0, 46)
+bubble.Position         = UDim2.new(0, 16, 0, 220)
+bubble.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
+bubble.AutoButtonColor  = false
+bubble.BorderSizePixel  = 0
+bubble.Text             = "❓"
+bubble.Font             = Enum.Font.GothamBold
+bubble.TextSize         = 22
+bubble.TextColor3       = Color3.fromRGB(255, 255, 255)
+bubble.ZIndex           = 10
+bubble.Parent           = gui
+
+local bc = Instance.new("UICorner")
+bc.CornerRadius = UDim.new(1, 0)
+bc.Parent = bubble
+
+local bs = Instance.new("UIStroke")
+bs.Color        = Color3.fromRGB(90, 90, 110)
+bs.Thickness    = 1.5
+bs.Transparency = 0.5
+bs.Parent       = bubble
+
+--==================== PANEL (3 rows) =======================
+local panel = Instance.new("CanvasGroup")
+panel.Name                   = "Panel"
+panel.Size                   = UDim2.new(0, 200, 0, 152)
+panel.BackgroundColor3       = Color3.fromRGB(22, 22, 30)
+panel.BackgroundTransparency = 0.02
+panel.BorderSizePixel        = 0
+panel.GroupTransparency      = 1
+panel.Visible                = false
+panel.ZIndex                 = 9
+panel.Parent                 = gui
+
+local pc = Instance.new("UICorner")
+pc.CornerRadius = UDim.new(0, 14)
+pc.Parent = panel
+
+local ps = Instance.new("UIStroke")
+ps.Color        = Color3.fromRGB(65, 65, 82)
+ps.Thickness    = 1
+ps.Transparency = 0.4
+ps.Parent       = panel
+
+local pscale = Instance.new("UIScale")
+pscale.Scale = 0.9
+pscale.Parent = panel
+
+local blocker = Instance.new("TextButton")
+blocker.Size                   = UDim2.new(1, 0, 1, 0)
+blocker.BackgroundTransparency = 1
+blocker.Text                   = ""
+blocker.AutoButtonColor        = false
+blocker.ZIndex                 = 10
+blocker.Parent                 = panel
+
+local function makeToggleRow(yOffset, titleText, subText)
+    local t = Instance.new("TextLabel")
+    t.Position              = UDim2.new(0, 14, 0, yOffset)
+    t.Size                  = UDim2.new(1, -90, 0, 18)
+    t.BackgroundTransparency = 1
+    t.Font                  = Enum.Font.GothamBold
+    t.TextSize              = 14
+    t.TextColor3            = Color3.fromRGB(240, 240, 246)
+    t.TextXAlignment        = Enum.TextXAlignment.Left
+    t.Text                  = titleText
+    t.ZIndex                = 11
+    t.Parent                = panel
+
+    local s = Instance.new("TextLabel")
+    s.Position              = UDim2.new(0, 14, 0, yOffset + 18)
+    s.Size                  = UDim2.new(1, -90, 0, 14)
+    s.BackgroundTransparency = 1
+    s.Font                  = Enum.Font.Gotham
+    s.TextSize              = 11
+    s.TextColor3            = Color3.fromRGB(150, 150, 168)
+    s.TextXAlignment        = Enum.TextXAlignment.Left
+    s.Text                  = subText
+    s.ZIndex                = 11
+    s.Parent                = panel
+
+    local tr = Instance.new("TextButton")
+    tr.Size             = UDim2.new(0, 52, 0, 28)
+    tr.Position         = UDim2.new(1, -66, 0, yOffset + 2)
+    tr.BackgroundColor3 = Color3.fromRGB(58, 58, 72)
+    tr.AutoButtonColor  = false
+    tr.BorderSizePixel  = 0
+    tr.Text             = ""
+    tr.ZIndex           = 11
+    tr.Parent           = panel
+
+    local tc = Instance.new("UICorner")
+    tc.CornerRadius = UDim.new(1, 0)
+    tc.Parent = tr
+
+    local kn = Instance.new("Frame")
+    kn.Size             = UDim2.new(0, 22, 0, 22)
+    kn.Position         = UDim2.new(0, 3, 0.5, -11)
+    kn.BackgroundColor3 = Color3.fromRGB(235, 235, 240)
+    kn.BorderSizePixel  = 0
+    kn.ZIndex           = 12
+    kn.Parent           = tr
+
+    local kc = Instance.new("UICorner")
+    kc.CornerRadius = UDim.new(1, 0)
+    kc.Parent = kn
+
+    return tr, kn
+end
+
+local multTrack,  multKnob  = makeToggleRow(14,  "Tap Speed",       "x" .. MULTIPLIER .. " (~50 CPS)")
+local staffTrack, staffKnob = makeToggleRow(58,  "Staff Check",     "Detect higher-ups (accurate)")
+local chamsTrack, chamsKnob = makeToggleRow(102, "Higher Up Chams", "Red outline + rank icon")
+
+--==================== PANEL HELPERS ========================
+local function syncPanel()
+    panel.Position = UDim2.new(
+        bubble.Position.X.Scale, bubble.Position.X.Offset,
+        bubble.Position.Y.Scale, bubble.Position.Y.Offset + 54
+    )
+end
+syncPanel()
+
+local function setToggleVisual(track, knob, state)
+    local info = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+    TweenService:Create(track, info, {
+        BackgroundColor3 = state and Color3.fromRGB(0, 200, 120) or Color3.fromRGB(58, 58, 72),
+    }):Play()
+    TweenService:Create(knob, info, {
+        Position = state and UDim2.new(0, 27, 0.5, -11) or UDim2.new(0, 3, 0.5, -11),
+    }):Play()
+end
+
+local function refreshBubbleColor()
+    bubble.TextColor3 = (enabled or staffAlertEnabled)
+        and Color3.fromRGB(120, 255, 190)
+        or Color3.fromRGB(255, 255, 255)
+end
+
+--==================== HIGHLIGHT / BILLBOARD ================
+local function applyStaffHighlight(plr)
+    local char = plr.Character
+    if not char then return end
+    if staffHighlights[plr.UserId] then
+        pcall(function() staffHighlights[plr.UserId]:Destroy() end)
+        staffHighlights[plr.UserId] = nil
+    end
+    local hl = Instance.new("Highlight")
+    hl.Name                = "StaffCham"
+    hl.Adornee             = char
+    hl.FillColor           = STAFF_CONFIG.HighlightColor
+    hl.OutlineColor        = STAFF_CONFIG.HighlightOutlineColor
+    hl.FillTransparency    = STAFF_CONFIG.HighlightFillTransparency
+    hl.OutlineTransparency = STAFF_CONFIG.HighlightOutlineTransparency
+    hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent              = char
+    staffHighlights[plr.UserId] = hl
+end
+
+local function removeStaffHighlight(userId)
+    if staffHighlights[userId] then
+        pcall(function() staffHighlights[userId]:Destroy() end)
+        staffHighlights[userId] = nil
+    end
+end
+
+local function applyStaffBillboard(plr, level)
+    local char = plr.Character
+    if not char then return end
+    local head
+    for _ = 1, 25 do
+        head = char:FindFirstChild("Head")
+        if head then break end
+        task.wait(0.1)
+    end
+    if not head then return end
+    if staffBillboards[plr.UserId] then
+        pcall(function() staffBillboards[plr.UserId]:Destroy() end)
+        staffBillboards[plr.UserId] = nil
+    end
+    local style     = STAFF_STYLES[level] or STAFF_STYLES.staff
+    local showLabel = STAFF_CONFIG.IconShowLabel
+    local height    = showLabel and 58 or 36
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name           = "StaffRankIcon"
+    bb.Adornee        = head
+    bb.Size           = UDim2.new(0, 80, 0, height)
+    bb.StudsOffset    = Vector3.new(0, STAFF_CONFIG.IconStudsOffset, 0)
+    bb.AlwaysOnTop    = true
+    bb.LightInfluence = 0
+    bb.MaxDistance    = STAFF_CONFIG.IconMaxDistance
+    bb.Parent         = head
+
+    local icon = Instance.new("TextLabel")
+    icon.BackgroundTransparency = 1
+    icon.Size                   = UDim2.new(1, 0, 0, 34)
+    icon.Position               = UDim2.new(0, 0, 0, 0)
+    icon.Font                   = Enum.Font.GothamBold
+    icon.TextSize               = 28
+    icon.Text                   = style.icon
+    icon.TextColor3             = style.color
+    icon.TextStrokeTransparency = 0
+    icon.TextStrokeColor3       = Color3.fromRGB(0, 0, 0)
+    icon.Parent                 = bb
+
+    if showLabel then
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Size                   = UDim2.new(1, 0, 0, 18)
+        label.Position               = UDim2.new(0, 0, 0, 36)
+        label.Font                   = Enum.Font.GothamBold
+        label.TextSize               = 12
+        label.Text                   = level:upper()
+        label.TextColor3             = style.color
+        label.TextStrokeTransparency = 0.35
+        label.TextStrokeColor3       = Color3.fromRGB(0, 0, 0)
+        label.Parent                 = bb
+    end
+
+    staffBillboards[plr.UserId] = bb
+end
+
+local function removeStaffBillboard(userId)
+    if staffBillboards[userId] then
+        pcall(function() staffBillboards[userId]:Destroy() end)
+        staffBillboards[userId] = nil
+    end
+end
+
+local function removeStaffVisuals(userId)
+    removeStaffHighlight(userId)
+    removeStaffBillboard(userId)
+end
+
+local function removeAllStaffVisuals()
+    for id in pairs(staffHighlights) do removeStaffHighlight(id) end
+    for id in pairs(staffBillboards) do removeStaffBillboard(id) end
+end
+
+local function applyStaffVisuals(plr, level)
+    if not plr.Character then return end
+    applyStaffHighlight(plr)
+    applyStaffBillboard(plr, level)
+end
+
+--==================== DETECTION HELPERS ====================
+local function getCachedRank(plr, groupId)
+    local key   = plr.UserId .. ":" .. tostring(groupId)
+    local entry = rankCache[key]
+    if entry and (os.clock() - entry.t) < RANK_CACHE_TTL then
+        return entry.rank
+    end
+    local ok, rank = pcall(function() return plr:GetRankInGroup(groupId) end)
+    if ok and type(rank) == "number" then
+        rankCache[key] = { rank = rank, t = os.clock() }
+        return rank
+    end
+    return 0
+end
+
+local function classifyRank(rank)
+    if rank <= 0 then return nil end
+    if rank >= STAFF_CONFIG.OwnerRankThreshold then return "owner"
+    elseif rank >= STAFF_CONFIG.AdminRankThreshold then return "admin"
+    elseif rank >= STAFF_CONFIG.ModRankThreshold then return "mod"
+    end
+    return nil
+end
+
+local function findAdminTool(plr)
+    local function matchesTool(name)
+        local lname = name:lower()
+        for _, base in ipairs(STAFF_CONFIG.AdminToolNames) do
+            if lname == base then return true end
+            if lname:sub(1, #base) == base then
+                local nextChar = lname:sub(#base + 1, #base + 1)
+                if nextChar == " " or nextChar == "(" or nextChar == "[" then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    local function checkContainer(container)
+        if not container then return nil end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and matchesTool(item.Name) then
+                return item
+            end
+        end
+        return nil
+    end
+    local found = checkContainer(plr:FindFirstChild("Backpack"))
+    if found then return found end
+    if plr.Character then
+        found = checkContainer(plr.Character)
+    end
+    return found
+end
+
+local function getCreatorGroupId()
+    if game.CreatorType == Enum.CreatorType.Group then
+        return game.CreatorId
+    end
+    return nil
+end
+
+local function getStaffLevel(plr)
+    -- 1) Game creator (user-owned game)
+    if STAFF_CONFIG.FlagCreator
+        and game.CreatorType == Enum.CreatorType.User
+        and plr.UserId == game.CreatorId then
+        return "owner", "Game Creator"
+    end
+
+    -- 2) Game's own creator group rank
+    local cgid = getCreatorGroupId()
+    if cgid then
+        local rank  = getCachedRank(plr, cgid)
+        local level = classifyRank(rank)
+        if level then
+            return level, "Group rank " .. rank
+        end
+    end
+
+    -- 3) Extra configured groups
+    for gid, thresholds in pairs(STAFF_CONFIG.ExtraGroups) do
+        if gid ~= cgid then
+            local rank = getCachedRank(plr, gid)
+            if rank > 0 then
+                local oT = thresholds.owner or 255
+                local aT = thresholds.admin or 200
+                local mT = thresholds.mod   or 100
+                local level
+                if rank >= oT then level = "owner"
+                elseif rank >= aT then level = "admin"
+                elseif rank >= mT then level = "mod"
+                end
+                if level then
+                    return level, "Group " .. gid .. " rank " .. rank
+                end
+            end
+        end
+    end
+
+    -- 4) Known staff (manual override)
+    local lname = plr.Name:lower()
+    if STAFF_CONFIG.KnownStaff[lname] then
+        return STAFF_CONFIG.KnownStaff[lname], "Known staff"
+    end
+
+    -- 5) Strict admin tool
+    local tool = findAdminTool(plr)
+    if tool then
+        return "admin", "Admin tool: " .. tool.Name
+    end
+
+    -- 6) Roblox staff (opt-in, unreliable)
+    if STAFF_CONFIG.CheckRobloxStaff then
+        local rank = getCachedRank(plr, 1)
+        if rank > 0 then
+            return "admin", "Roblox group member"
+        end
+    end
+
+    return nil
+end
+
+--==================== SCANNING =============================
+local function countKnownStaff()
+    local n = 0
+    for _ in pairs(knownStaff) do n += 1 end
+    return n
+end
+
+local function scanAllPlayers(warnIfEmpty)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player then
+            local level, reason = getStaffLevel(plr)
+            if level then
+                local prev = knownStaff[plr.UserId]
+                knownStaff[plr.UserId]       = level
+                knownStaffReason[plr.UserId] = reason
+
+                if prev ~= level then
+                    local style  = STAFF_STYLES[level] or STAFF_STYLES.staff
+                    local suffix = reason and (" [" .. reason .. "]") or ""
+                    notify(level:upper() .. " — " .. plr.DisplayName ..
+                           " (@" .. plr.Name .. ")" .. suffix, true, style)
+                    if chamsEnabled then
+                        applyStaffVisuals(plr, level)
+                    end
+                elseif chamsEnabled and not staffHighlights[plr.UserId] then
+                    applyStaffVisuals(plr, level)
+                end
+
+                if not staffTracked[plr.UserId] then
+                    staffTracked[plr.UserId] = true
+                    plr.CharacterAdded:Connect(function()
+                        if not chamsEnabled then return end
+                        local lvl = knownStaff[plr.UserId]
+                        if not lvl then return end
+                        task.wait(0.3)
+                        if chamsEnabled and knownStaff[plr.UserId] then
+                            applyStaffVisuals(plr, lvl)
+                        end
+                    end)
+                end
+            else
+                if knownStaff[plr.UserId] then
+                    knownStaff[plr.UserId]       = nil
+                    knownStaffReason[plr.UserId] = nil
+                    removeStaffVisuals(plr.UserId)
+                end
+            end
+        end
+    end
+
+    if warnIfEmpty then
+        local n = countKnownStaff()
+        if n == 0 and not hasWarnedNoStaff then
+            hasWarnedNoStaff = true
+            notify("No higher-ups detected in this server", false, EMPTY_STYLE)
+        elseif n > 0 then
+            hasWarnedNoStaff = false
+        end
+    end
+end
+
+--==================== DEEP SCAN (informational) ============
+local function matchesAny(name, keywords)
+    local lower = name:lower()
+    for _, kw in ipairs(keywords) do
+        if lower:find(kw, 1, true) then return kw end
+    end
+    return nil
+end
+
+local function deepScanAdminSystems()
+    local found = { systems = {}, remotes = {}, guis = {} }
+    local services = {
+        game:GetService("ReplicatedStorage"),
+        game:GetService("ReplicatedFirst"),
+    }
+    for sysName, names in pairs(STAFF_CONFIG.KnownSystems) do
+        local matched = false
+        for _, svc in ipairs(services) do
+            for _, name in ipairs(names) do
+                local inst = svc:FindFirstChild(name)
+                if inst then
+                    table.insert(found.systems, { name = sysName, instance = inst })
+                    matched = true
+                    break
+                end
+            end
+            if matched then break end
+        end
+    end
+
+    local containers = {
+        game:GetService("ReplicatedStorage"),
+        game:GetService("ReplicatedFirst"),
+        game:GetService("Workspace"),
+        game:GetService("Lighting"),
+    }
+    local scanned = 0
+    for _, container in ipairs(containers) do
+        local ok, descendants = pcall(function() return container:GetDescendants() end)
+        if ok and descendants then
+            for _, desc in ipairs(descendants) do
+                scanned += 1
+                if scanned % 400 == 0 then task.wait() end
+                local kw = matchesAny(desc.Name, STAFF_CONFIG.AdminKeywords)
+                if kw then
+                    local cls = desc.ClassName
+                    if cls == "RemoteEvent" or cls == "RemoteFunction" then
+                        table.insert(found.remotes, { name = desc.Name, class = cls })
+                    elseif cls == "ScreenGui" or cls == "Folder"
+                        or cls == "ModuleScript" or cls == "Configuration" then
+                        local dup = false
+                        for _, g in ipairs(found.guis) do
+                            if g.name == desc.Name then dup = true break end
+                        end
+                        if not dup then
+                            table.insert(found.guis, { name = desc.Name, class = cls })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function runDeepScan()
+    if deepScanRunning then return end
+    deepScanRunning = true
+    lastDeepScan = os.clock()
+
+    local ok, result = pcall(deepScanAdminSystems)
+    if not ok or not result then
+        deepScanRunning = false
+        notify("Deep scan failed — try again", false, EMPTY_STYLE)
+        return
+    end
+
+    for _, sys in ipairs(result.systems) do
+        if not detectedSystems[sys.name] then
+            detectedSystems[sys.name] = true
+            notify("Admin system: " .. sys.name, true, SYSTEM_STYLE)
+        end
+    end
+    for _, r in ipairs(result.remotes) do
+        local key = "remote:" .. r.name
+        if not detectedSystems[key] then
+            detectedSystems[key] = true
+            notify("Admin remote: " .. r.name, true, SYSTEM_STYLE)
+        end
+    end
+    for _, g in ipairs(result.guis) do
+        local key = "gui:" .. g.name
+        if not detectedSystems[key] then
+            detectedSystems[key] = true
+            notify("Admin panel: " .. g.name, true, SYSTEM_STYLE)
+        end
+    end
+    if #result.systems == 0 and #result.remotes == 0 and #result.guis == 0 then
+        if not detectedSystems["__none__"] then
+            detectedSystems["__none__"] = true
+            notify("No admin systems detected in this game", false, EMPTY_STYLE)
+        end
+    else
+        detectedSystems["__none__"] = nil
+    end
+
+    deepScanRunning = false
+end
+
+--==================== SCAN LOOPS ===========================
+local function startStaffScan()
+    if staffScanRunning then return end
+    staffScanRunning = true
+    task.spawn(function()
+        scanAllPlayers(false)
+        task.wait(STAFF_CONFIG.InitialGraceTime)
+        scanAllPlayers(true)
+        runDeepScan()
+        while staffScanRunning and staffAlertEnabled do
+            task.wait(STAFF_CONFIG.ScanInterval)
+            scanAllPlayers(true)
+            if os.clock() - lastDeepScan >= STAFF_CONFIG.DeepScanInterval then
+                runDeepScan()
+            end
+        end
+        staffScanRunning = false
+    end)
+end
+
+--==================== TOGGLE LOGIC =========================
+local function refreshChams()
+    if not chamsEnabled then
+        removeAllStaffVisuals()
+        return
+    end
+    for userId, level in pairs(knownStaff) do
+        local plr = Players:GetPlayerByUserId(userId)
+        if plr and plr.Character then
+            applyStaffVisuals(plr, level)
+        end
+    end
+end
+
+local function setChams(state)
+    chamsEnabled = state
+    setToggleVisual(chamsTrack, chamsKnob, state)
+    if state then
+        if not staffAlertEnabled then
+            notify("Tip: enable Staff Check first to detect higher-ups", false, EMPTY_STYLE)
+        end
+        notify("Higher Up Chams — ON", true)
+        refreshChams()
+    else
+        notify("Higher Up Chams — OFF", false)
+        removeAllStaffVisuals()
+    end
+end
+
+local function setStaffCheck(state)
+    staffAlertEnabled = state
+    setToggleVisual(staffTrack, staffKnob, state)
+    refreshBubbleColor()
+
+    if state then
+        hasWarnedNoStaff = false
+        detectedSystems  = {}
+        knownStaff       = {}
+        knownStaffReason = {}
+        staffTracked     = {}
+        notify("Staff Check — ON (accurate detection…)", true)
+        startStaffScan()
+    else
+        notify("Staff Check — OFF", false)
+        staffScanRunning = false
+        removeAllStaffVisuals()
+        knownStaff       = {}
+        knownStaffReason = {}
+        staffTracked     = {}
+        detectedSystems  = {}
+        hasWarnedNoStaff = false
+        if chamsEnabled then
+            -- keep the toggle state but nothing to show
+        end
+    end
+end
+
+local function setEnabled(state)
+    enabled = state
+    setToggleVisual(multTrack, multKnob, state)
+    refreshBubbleColor()
+    notify(state and ("Tap Speed x" .. MULTIPLIER .. " — ON")
+                or ("Tap Speed x" .. MULTIPLIER .. " — OFF"), state)
+end
+
+multTrack.Activated:Connect(function()  setEnabled(not enabled) end)
+staffTrack.Activated:Connect(function() setStaffCheck(not staffAlertEnabled) end)
+chamsTrack.Activated:Connect(function() setChams(not chamsEnabled) end)
+
+--==================== PLAYER EVENTS ========================
+Players.PlayerAdded:Connect(function()
+    if staffAlertEnabled then
+        task.wait(0.2)
+        scanAllPlayers(false)
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+    knownStaff[plr.UserId]       = nil
+    knownStaffReason[plr.UserId] = nil
+    removeStaffVisuals(plr.UserId)
+end)
+
+--==================== PANEL OPEN/CLOSE =====================
+local panelOpen = false
+local function setPanel(open)
+    panelOpen = open
+    syncPanel()
+    if open then
+        panel.Visible = true
+        TweenService:Create(panel, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+            GroupTransparency = 0,
+        }):Play()
+        TweenService:Create(pscale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            Scale = 1,
+        }):Play()
+    else
+        TweenService:Create(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            GroupTransparency = 1,
+        }):Play()
+        TweenService:Create(pscale, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+            Scale = 0.9,
+        }):Play()
+        task.delay(0.2, function()
+            if not panelOpen then panel.Visible = false end
+        end)
+    end
+end
+
+--==================== BUBBLE DRAG + TAP ====================
+local dragging    = false
+local dragged     = false
+local dragStart   = nil
+local startPos    = nil
+local activeTouch = nil
+
+bubble.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    dragging    = true
+    dragged     = false
+    dragStart   = input.Position
+    startPos    = bubble.Position
+    activeTouch = input
+end)
+
+UIS.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if activeTouch and input ~= activeTouch then return end
+    local delta = input.Position - dragStart
+    if not dragged and delta.Magnitude > 8 then dragged = true end
+    if dragged then
+        bubble.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+        syncPanel()
+    end
+end)
+
+UIS.InputEnded:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if activeTouch and input ~= activeTouch then return end
+    dragging    = false
+    activeTouch = nil
+    if not dragged then setPanel(not panelOpen) end
+end)
+
+--==================== TAP REPLAY ===========================
+local function sendTouchTap(x, y)
+    simulatedUntil = os.clock() + PRESS_GAP + 0.02
+    pcall(function()
+        VIM:SendTouchEvent(x, y, Enum.UserInputState.Begin, false, game)
+        task.wait(PRESS_GAP)
+        VIM:SendTouchEvent(x, y, Enum.UserInputState.End, false, game)
+    end)
+end
+
+local function pointInside(obj, x, y)
+    if not obj.Visible then return false end
+    local p, s = obj.AbsolutePosition, obj.AbsoluteSize
+    return x >= p.X and x <= p.X + s.X and y >= p.Y and y <= p.Y + s.Y
+end
+
+local lastTap = 0
+
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if gameProcessed then return end
+    if os.clock() < simulatedUntil then return end
+    local x, y = input.Position.X, input.Position.Y
+    if pointInside(bubble, x, y) then return end
+    if panelOpen and pointInside(panel, x, y) then return end
+    if enabled then
+        local now = os.clock()
+        if now - lastTap < DEBOUNCE then return end
+        lastTap = now
+        task.spawn(function()
+            for i = 2, MULTIPLIER do
+                if not enabled then break end
+                sendTouchTap(x, y)
+                task.wait(i <= BURST_COUNT and BURST_GAP or REPLAY_GAP)
+            end
+        end)
+    end
+end)
+
+notify("Staff Check loaded — tap ❓", true)
